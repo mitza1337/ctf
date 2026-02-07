@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="mitza's CTF writeups and practical exploitation notes.">
+  <title>mitza // CTF Writeups</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="bg-glow" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <div class="container nav-wrap">
+      <a class="brand" href="index.html">mitza<span class="brand-pulse">.ctf</span></a>
+      <button class="menu-btn" id="menuBtn" aria-label="Toggle menu">Menu</button>
+      <nav class="site-nav" id="siteNav">
+        <a href="#writeups">Writeups</a>
+        <a href="#about">About</a>
+        <a href="https://app.cyber-edu.co/user/9b4bc336-58f0-422a-9a22-9b6f4694d2cb?tenant=cyberedu" target="_blank" rel="noopener noreferrer">Cyber-EDU</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero container reveal">
+      <p class="kicker">small CTF corner • notes by mitza</p>
+      <h1><span class="accent">mitza</span>'s writeup stash</h1>
+      <p class="hero-text">
+        Hey, I'm <strong>Tudor Mihai Alexandru</strong>. This is just my relaxed blog where I drop
+        writeups after solving challenges, mostly web stuff and whatever weird chain I run into.
+      </p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="#writeups">Open Writeups</a>
+        <a class="btn btn-ghost" href="https://app.cyber-edu.co/user/9b4bc336-58f0-422a-9a22-9b6f4694d2cb?tenant=cyberedu" target="_blank" rel="noopener noreferrer">Cyber-EDU Profile</a>
+      </div>
+    </section>
+
+    <section id="about" class="container stats reveal">
+      <article class="stat-card">
+        <h2>Operator</h2>
+        <p class="mono">mitza / Tudor Mihai Alexandru</p>
+      </article>
+      <article class="stat-card">
+        <h2>Focus</h2>
+        <p class="mono">Web exploitation, SSRF, SSTI, privilege escalation</p>
+      </article>
+      <article class="stat-card">
+        <h2>Platform</h2>
+        <p class="mono"><a href="https://app.cyber-edu.co/user/9b4bc336-58f0-422a-9a22-9b6f4694d2cb?tenant=cyberedu" target="_blank" rel="noopener noreferrer">Cyber-EDU profile</a></p>
+      </article>
+    </section>
+
+    <section id="writeups" class="container writeups reveal">
+      <div class="section-head">
+        <h2>Writeups</h2>
+        <p>Mostly raw notes, but clean enough to reproduce the solve path.</p>
+      </div>
+
+      <article class="writeup-card featured">
+        <div class="tag-row">
+          <span class="tag">WEB</span>
+          <span class="tag">SSRF</span>
+          <span class="tag">SSTI</span>
+          <span class="tag">PRIVESC</span>
+        </div>
+        <h3>Rocket</h3>
+        <p>
+          Fun chain: SSRF filter bypass, internal Flask blog pop via SSTI, RCE as low-priv user,
+          then root through cron + logrotate + writable script.
+        </p>
+        <a class="btn btn-primary" href="writeups/rocket.html">Read Full Writeup</a>
+      </article>
+    </section>
+  </main>
+
+  <footer class="site-footer container">
+    <p>made by mitza (Tudor Mihai Alexandru) • just posting solves and notes</p>
+  </footer>
+
+  <script src="assets/app.js"></script>
+</body>
+</html>

