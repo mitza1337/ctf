@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Full reverse engineering writeup for the optimus-prime challenge.">
+  <title>Optimus Prime Writeup // mitza</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="bg-glow" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <div class="container nav-wrap">
+      <a class="brand" href="../index.html">mitza<span class="brand-pulse">.ctf</span></a>
+      <button class="menu-btn" id="menuBtn" aria-label="Toggle menu">Menu</button>
+      <nav class="site-nav" id="siteNav">
+        <a href="../index.html#writeups">Writeups</a>
+        <a href="https://app.cyber-edu.co/user/9b4bc336-58f0-422a-9a22-9b6f4694d2cb?tenant=cyberedu" target="_blank" rel="noopener noreferrer">Cyber-EDU</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container article-wrap">
+    <article class="article-card reveal">
+      <a class="btn btn-ghost" href="../index.html">← Back to writeups</a>
+
+      <div class="article-meta">
+        <span>Challenge: optimus-prime</span>
+        <span>Category: Reverse Engineering</span>
+        <span>Author: mitza (Tudor Mihai Alexandru)</span>
+      </div>
+
+      <h1>optimus-prime - full reverse solve writeup</h1>
+      <p class="article-lead">
+        This challenge hint was: <em>"It is rumored that a quantum computer could solve this in under one second."</em>
+        Real meaning: the binary computes the flag character by character with intentionally expensive math and recursion,
+        so direct execution is slow. The practical solve is to reverse the algorithm and reimplement it with memoization.
+      </p>
+
+      <p class="note">
+        Goal format: <code>DCTF{[0-9a-f]{64}}</code>. Binary provided: <code>optimus-prime</code>.
+      </p>
+
+      <ol class="toc">
+        <li><a href="#recon">Quick Recon</a></li>
+        <li><a href="#protections">Protection and Anti-Analysis Checks</a></li>
+        <li><a href="#main-loop">Finding the Real Decrypt Loop</a></li>
+        <li><a href="#static-data">Extracting Static Tables</a></li>
+        <li><a href="#core-funcs">Reconstructing Core Functions</a></li>
+        <li><a href="#char-formula">Per-Character Formula</a></li>
+        <li><a href="#solver">Building the Offline Solver</a></li>
+        <li><a href="#flag">Flag</a></li>
+        <li><a href="#takeaways">Takeaways</a></li>
+      </ol>
+
+      <h2 id="recon">1. Quick Recon</h2>
+      <p>First triage:</p>
+      <pre><code class="language-bash">ls -la
+file ./optimus-prime
+checksec --file=./optimus-prime
+strings -n 4 ./optimus-prime | head -n 80</code></pre>
+      <p>Important findings:</p>
+      <ul>
+        <li>64-bit stripped PIE ELF, dynamically linked.</li>
+        <li>NX enabled, Full RELRO, no canary.</li>
+        <li>Interesting strings: <code>/proc/self/status</code>, <code>TracerPid:</code>, <code>Computing flag...</code>, <code>Decrypted flag: %s</code>.</li>
+      </ul>
+      <p>
+        Running the binary prints <code>Computing flag...</code> and starts outputting flag characters immediately,
+        but very slowly. So this is not a strict checker; it is a slow flag generator.
+      </p>
+
+      <h2 id="protections">2. Protection and Anti-Analysis Checks</h2>
+      <p>
+        From disassembly, <code>main</code> calls four functions in order:
+      </p>
+      <pre><code class="language-text">fcn.00001390
+fcn.00001430
+fcn.00001280
+fcn.00001f50</code></pre>
+      <p>
+        Reverse summary:
+      </p>
+      <ol>
+        <li><code>fcn.00001390</code>: reads <code>/proc/self/status</code>, parses <code>TracerPid:</code>, exits if non-zero. Basic anti-debug.</li>
+        <li><code>fcn.00001430</code>: measures runtime of a fixed arithmetic loop and exits if slower than <code>0xC350</code> microseconds (50 ms). Anti-instrumentation/anti-emulation timing check.</li>
+        <li><code>fcn.00001280</code>: extra arithmetic warmup/obfuscation loop (100 rounds, modulo-like transformations).</li>
+        <li><code>fcn.00001f50</code>: actual flag generation and printing loop.</li>
+      </ol>
+      <p>
+        None of these checks block a pure static + offline reimplementation strategy.
+      </p>
+
+      <h2 id="main-loop">3. Finding the Real Decrypt Loop</h2>
+      <p>
+        Function <code>0x1f50</code> prints one character per iteration and flushes stdout each time. Loop counter is <code>r15</code>, from <code>0</code> to <code>0x45</code>, so output length is <strong>70</strong> bytes.
+      </p>
+      <p>
+        Per iteration:
+      </p>
+      <ul>
+        <li>Load one 32-bit value from table at <code>.rodata + 0x3100</code>.</li>
+        <li>Compute a 64-bit state via recursive helper <code>fcn.00001c90</code> (for these inputs, always taken).</li>
+        <li>Fold bytes and apply small algebraic transform to produce one byte.</li>
+        <li>XOR with byte from key table at <code>.rodata + 0x30a0</code>.</li>
+        <li>Print resulting character.</li>
+      </ul>
+      <p>
+        The control flow has branch noise that can output constants for tiny inputs, but table inputs are all &gt; 2, so only the expensive recursive path matters.
+      </p>
+
+      <h2 id="static-data">4. Extracting Static Tables</h2>
+      <p>Dumping <code>.rodata</code> gave all required constants:</p>
+      <pre><code class="language-bash">objdump -s -j .rodata ./optimus-prime</code></pre>
+      <p>
+        Relevant regions:
+      </p>
+      <ul>
+        <li><code>0x3100..</code>: 70 dwords: <code>0x0f, 0x17, 0x1f, ...</code> i.e. <code>n[i] = 0x0f + 8*i</code></li>
+        <li><code>0x30a0..</code>: 70-byte XOR key stream</li>
+        <li><code>0x3060..</code>: qword constants used by helper mixers</li>
+      </ul>
+      <p>Extracted key bytes:</p>
+      <pre><code class="language-text">4c9e068a51f18a75a89368ba7f78f00814ad4c42a978d4d59859273b9737
+ffe82b521d5c8c4902f06cf52f95c5111cce427f705b4afd60c0f4076180
+e687a4913b8cbac74df8</code></pre>
+
+      <h2 id="core-funcs">5. Reconstructing Core Functions</h2>
+      <p>
+        The heavy part is a recursive chain:
+      </p>
+      <pre><code class="language-text">f1c90(n)  [at 0x1c90]
+  ├─ uses f1530(x, m) [0x1530]
+  ├─ uses f16e0(x, m) [0x16e0]
+  └─ uses f1b30(x, m) [0x1b30]</code></pre>
+      <p>
+        All four functions are recursive and full of equivalent-but-obscure base cases. Manual execution is unrealistic.
+        I converted each to Python using unsigned 64-bit arithmetic and memoization.
+      </p>
+      <p>Important constants seen across functions:</p>
+      <pre><code class="language-text">0x9e3779b97f4a7c15
+0x9e3779b97f4ac2fa
+0xc6a4a7935bd1e995
+0xdeadbeef
+0xbeef
+0xbabe
+0x0123456789abcdef
+0x0123456789ab7751</code></pre>
+
+      <h2 id="char-formula">6. Per-Character Formula</h2>
+      <p>Once a 64-bit value <code>x = f1c90(n[i])</code> is available, one output byte is:</p>
+      <pre><code class="language-python">y = x ^ (x >> 8) ^ (x >> 16) ^ (x >> 24) ^ (x >> 32) ^ (x >> 40) ^ (x >> 48) ^ (x >> 56)
+z = (y * 8) ^ (y << 7) ^ y
+al = ((z &amp; 0xffffffff) * 0x15) &amp; 0xff
+out[i] = al ^ key[i]</code></pre>
+      <p>
+        This is equivalent to a custom byte-mixing + keystream XOR decryption layer.
+      </p>
+
+      <h2 id="solver">7. Building the Offline Solver</h2>
+      <p>
+        The following script mirrors the reversed logic (with memoization) and reconstructs all 70 characters instantly.
+      </p>
+      <pre><code class="language-python">from functools import lru_cache
+
+MASK = (1 &lt;&lt; 64) - 1
+C1 = 0x9e3779b97f4a7c15
+C1_ALT = 0x9e3779b97f4ac2fa
+C2 = 0xc6a4a7935bd1e995
+D = 0xdeadbeef
+BEEF = 0xbeef
+BABE = 0xbabe
+C3 = 0x0123456789abcdef
+C3_ALT = 0x0123456789ab7751
+
+def u64(x): return x &amp; MASK
+def rol(x, r): return u64((x &lt;&lt; r) | (x &gt;&gt; (64 - r)))
+def swap32(x): return ((x &amp; 0xffffffff) &lt;&lt; 32) | ((x &gt;&gt; 32) &amp; 0xffffffff)
+
+@lru_cache(maxsize=None)
+def f1530(x, m):
+    x = u64(x)
+    if m &lt;= 1: r12 = x
+    elif m == 2: r12 = u64(C1 ^ x)
+    elif m == 3: r12 = u64((C2 * x) ^ D)
+    else: r12 = f1530(x, m - 1)
+
+    xp1 = u64(x + 1)
+    if m &lt;= 2: r13 = xp1
+    elif m == 3: r13 = u64(xp1 ^ C1)
+    elif m == 4: r13 = u64((C2 * xp1) ^ D)
+    else: r13 = f1530(xp1, m - 2)
+
+    xb = u64(x ^ BEEF)
+    if m &lt;= 3: rdi = xb
+    elif m == 4: rdi = u64(C1_ALT ^ x)
+    elif m == 5: rdi = u64((C2 * xb) ^ D)
+    else: rdi = f1530(xb, m - 3)
+
+    return u64(r12 + r13 + rdi)
+
+@lru_cache(maxsize=None)
+def f1b30(x, m):
+    x = u64(x)
+    if m &lt;= 1: a = x
+    elif m == 2: a = u64(C3 ^ x)
+    elif m == 3: a = rol(x, 7)
+    else: a = f1b30(x, m - 1)
+
+    xp = u64(x + 0xcafe)
+    if m &lt;= 2: b = xp
+    elif m == 3: b = u64(xp ^ C3)
+    elif m == 4: b = rol(xp, 7)
+    else: b = f1b30(xp, m - 2)
+
+    xb = u64(x ^ BABE)
+    if m &lt;= 3: c = xb
+    elif m == 4: c = u64(C3_ALT ^ x)
+    elif m == 5: c = rol(xb, 7)
+    else: c = f1b30(xb, m - 3)
+
+    w = u64(a ^ b) &gt;&gt; 13
+    return u64(a + b + c + w + w)
+
+def mix_final(rdi, r12, rbp):
+    return u64(rdi + r12 + rbp + swap32(u64(r12 ^ rbp)))
+
+@lru_cache(maxsize=None)
+def f16e0(x, m):
+    x = u64(x)
+    xh = u64(x ^ 0x1337)
+
+    if m == 3:
+        A = u64(xh * C1)
+        B = u64((C2 * x) ^ D)
+        return mix_final(u64(x + 3), A, B)
+
+    if m == 4:
+        A = u64(xh * C1)
+        B = u64((C2 * x) ^ D)
+        p = mix_final(u64(x + 3), A, B)
+        return mix_final(u64((x + 4) * C1), u64((C2 * xh) ^ D), p)
+
+    if m == 5:
+        A = u64(xh * C1)
+        B = u64((C2 * x) ^ D)
+        p = mix_final(u64(x + 3), A, B)
+        q = mix_final(u64((x + 4) * C1), u64((C2 * xh) ^ D), p)
+        return mix_final(u64((C2 * u64(x + 5)) ^ D), f16e0(xh, 3), q)
+
+    if m == 6:
+        p = mix_final(u64((x + 4) * C1), u64((C2 * xh) ^ D), f16e0(x, 3))
+        q = mix_final(u64((C2 * u64(x + 5)) ^ D), f16e0(xh, 3), p)
+        return mix_final(f16e0(u64(x + 6), 3), f16e0(xh, 4), q)
+
+    raise ValueError(m)
+
+@lru_cache(maxsize=None)
+def f1c90(n):
+    if n &lt;= 2:
+        r12 = rbx = r13 = 1
+    elif n == 3:
+        r12, rbx, r13 = 5, 1, 1
+    elif n == 4:
+        r12, rbx, r13 = f1c90(3), 5, 1
+    elif n == 5:
+        r12, rbx, r13 = f1c90(4), f1c90(3), 5
+    else:
+        r12, rbx, r13 = f1c90(n - 1), f1c90(n - 2), f1c90(n - 3)
+
+    var38 = f1530(n, (n % 5) + 3)
+    var30 = f16e0(n, (n % 4) + 3)
+    var28 = f1b30(n, (n % 3) + 3)
+    acc = (var38 &amp; 0xff) + (var30 &amp; 0xff) + (var28 &amp; 0xff)
+    return u64(acc + r13 + r12 + rbx)
+
+key = bytes.fromhex(
+    "4c9e068a51f18a75a89368ba7f78f00814ad4c42a978d4d59859273b9737"
+    "ffe82b521d5c8c4902f06cf52f95c5111cce427f705b4afd60c0f4076180"
+    "e687a4913b8cbac74df8"
+)
+
+vals = [0x0f + 8 * i for i in range(70)]
+out = []
+for i, n in enumerate(vals):
+    x = f1c90(n)
+    y = x ^ (x &gt;&gt; 8) ^ (x &gt;&gt; 16) ^ (x &gt;&gt; 24) ^ (x &gt;&gt; 32) ^ (x &gt;&gt; 40) ^ (x &gt;&gt; 48) ^ (x &gt;&gt; 56)
+    z = u64(u64(y * 8) ^ u64(y &lt;&lt; 7) ^ y)
+    al = ((z &amp; 0xffffffff) * 0x15) &amp; 0xff
+    out.append(al ^ key[i])
+
+print(bytes(out).decode())</code></pre>
+      <p>Output:</p>
+      <pre><code class="language-text">[flag output intentionally omitted]</code></pre>
+      <p>
+        This matches required format exactly: <code>DCTF{[0-9a-f]{64}}</code>.
+      </p>
+
+      <h2 id="flag">8. Flag</h2>
+      <div class="flag-box">
+        <strong>Final flag:</strong><br>
+        <code>[withheld]</code>
+      </div>
+
+      <h2 id="takeaways">9. Takeaways</h2>
+      <ol>
+        <li>When a binary prints output but is extremely slow, treat it like an obfuscated generator and reimplement offline.</li>
+        <li>Anti-debug checks based on <code>TracerPid</code> and time thresholds are easy to bypass with static analysis.</li>
+        <li>Memoization is essential for recursive RE challenges; otherwise runtime explodes.</li>
+        <li>Always extract and trust static tables from <code>.rodata</code> first, then rebuild logic around them.</li>
+      </ol>
+
+      <p class="note">
+        Writeup by <strong>mitza</strong> (<strong>Tudor Mihai Alexandru</strong>).<br>
+        More challenge notes: <a href="https://app.cyber-edu.co/user/9b4bc336-58f0-422a-9a22-9b6f4694d2cb?tenant=cyberedu" target="_blank" rel="noopener noreferrer">Cyber-EDU profile</a>
+      </p>
+    </article>
+  </main>
+
+  <footer class="site-footer container">
+    <p>mitza.ctf • Practical offensive notes from solved challenges</p>
+  </footer>
+
+  <script src="../assets/app.js"></script>
+</body>
+</html>
