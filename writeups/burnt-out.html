@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Full reverse engineering writeup for the burnt-out challenge.">
+  <title>burnt-out Writeup // mitza</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="bg-glow" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <div class="container nav-wrap">
+      <a class="brand" href="../index.html">mitza<span class="brand-pulse">.ctf</span></a>
+      <button class="menu-btn" id="menuBtn" aria-label="Toggle menu">Menu</button>
+      <nav class="site-nav" id="siteNav">
+        <a href="../index.html#writeups">Writeups</a>
+        <a href="https://app.cyber-edu.co/user/9b4bc336-58f0-422a-9a22-9b6f4694d2cb?tenant=cyberedu" target="_blank" rel="noopener noreferrer">Cyber-EDU</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container article-wrap">
+    <article class="article-card reveal">
+      <a class="btn btn-ghost" href="../index.html">← Back to writeups</a>
+
+      <div class="article-meta">
+        <span>Challenge: burnt-out</span>
+        <span>Category: Reverse Engineering</span>
+        <span>Author: mitza (Tudor Mihai Alexandru)</span>
+      </div>
+
+      <h1>burnt-out - full reverse solve writeup</h1>
+      <p class="article-lead">
+        This one looked like a game config repair task, but the core trick was a weak runtime reflection system that compares
+        only string hashes. That design bug lets us feed arbitrary collision keys, build hidden action/predicate objects,
+        and drive the player to the goal on both local and remote instances.
+      </p>
+
+      <p class="note">
+        Provided artifacts: stripped PIE ELF (<code>application/octet-stream</code>) and remote service
+        <code>nc 34.179.171.239 31095</code>. Goal format is the standard DCTF token with braces.
+      </p>
+
+      <ol class="toc">
+        <li><a href="#triage">Quick Triage</a></li>
+        <li><a href="#input-model">Understanding the Input Model</a></li>
+        <li><a href="#hash-bug">Critical Bug: Hash-Only Field/Type Resolution</a></li>
+        <li><a href="#metadata">Recovering Runtime Type Metadata</a></li>
+        <li><a href="#actions">Action/Predicate VM Reconstruction</a></li>
+        <li><a href="#strategy">Building a Deterministic Win Strategy</a></li>
+        <li><a href="#collisions">Generating Collision Keys</a></li>
+        <li><a href="#payload">Final Payload Structure</a></li>
+        <li><a href="#remote">Remote Solve</a></li>
+        <li><a href="#lessons">Takeaways</a></li>
+      </ol>
+
+      <h2 id="triage">1. Quick Triage</h2>
+      <pre><code class="language-bash">file ./game-release-1362197-jenkins-test-build_final2
+checksec --file=./game-release-1362197-jenkins-test-build_final2
+strings -n 5 ./game-release-1362197-jenkins-test-build_final2 | head -n 120</code></pre>
+      <p>
+        The binary is a stripped 64-bit PIE ELF. Strings show an in-binary decoy message that looks like a flag, but it is
+        intentionally not the real remote value. So we need full behavioral solve, not just string extraction.
+      </p>
+
+      <h2 id="input-model">2. Understanding the Input Model</h2>
+      <p>
+        Running the program shows it expects JSON text terminated by a line containing <code>END</code>. The root object is not a typed
+        object itself; it must contain fields like <code>on_start</code>.
+      </p>
+      <p>Minimal valid config:</p>
+      <pre><code class="language-json">{
+  "on_start": [
+    {
+      "$type": "log_action_t",
+      "message": "hi"
+    }
+  ]
+}
+END</code></pre>
+      <p>
+        This executes 32 ticks, then prints madness/death text if no goal reached. That gave the first execution baseline.
+      </p>
+
+      <h2 id="hash-bug">3. Critical Bug: Hash-Only Field/Type Resolution</h2>
+      <p>
+        Reversing the lookup function (<code>fcn.00004cb0</code>) shows the parser computes:
+      </p>
+      <pre><code class="language-c">h = sum((i + 1) * s[i])</code></pre>
+      <p>
+        Then it resolves type/field definitions by hash table lookup, without final string equality verification.
+        This means any string that hashes to the expected value is accepted as that semantic field or type name.
+      </p>
+      <p>
+        This single flaw is the whole challenge pivot: we can synthesize valid objects using collision keys even when we do not know
+        the original source names.
+      </p>
+
+      <h2 id="metadata">4. Recovering Runtime Type Metadata</h2>
+      <p>
+        The binary builds a reflection table at runtime (type entries + field descriptors + hash buckets).
+        I dumped these regions in <code>gdb</code> after initialization and parsed them offline.
+      </p>
+      <pre><code class="language-bash"># key snapshots dumped from process memory:
+/tmp/types.bin
+/tmp/ht.bin
+/tmp/alloc_chunk.bin</code></pre>
+      <p>
+        Parsing these structures gave all required hashes and field layouts for the gameplay VM objects:
+      </p>
+      <ul>
+        <li><code>player_t</code> hash path and root field hashes (including <code>on_start</code> hash <code>0xf7c</code>).</li>
+        <li><code>log_action_t</code> type hash <code>0x205e</code>, message field hash <code>0xb6e</code>.</li>
+        <li><code>move_action</code> type hash <code>0x572e</code>, direction field hash <code>0x28c</code>.</li>
+        <li>Predicate/action container types used for conditional execution (<code>0x4ddd</code>, <code>0x31cc</code>, <code>0xaffd</code>).</li>
+      </ul>
+
+      <h2 id="actions">5. Action/Predicate VM Reconstruction</h2>
+      <p>
+        Dispatcher logic in <code>fcn.00002120</code> maps type hashes to callbacks. Important callbacks:
+      </p>
+      <ul>
+        <li><code>0x1740</code>: print message action.</li>
+        <li><code>0x17e0</code>: movement action.</li>
+        <li><code>0x1770</code>: conditional/compound action with predicate list + nested action list.</li>
+        <li><code>0x1ba0</code>/<code>0x1c60</code>: predicate combinators.</li>
+        <li><code>0x1cc0</code>: directional blocked/lava check predicate.</li>
+      </ul>
+      <p>
+        Movement callback details from disassembly:
+      </p>
+      <ul>
+        <li>Direction enum is 1..4 (0 is invalid and asserts).</li>
+        <li>World bounds are <code>0..29</code> on each axis (30x30).</li>
+        <li>Checks occupancy and lava maps before committing move.</li>
+        <li>If player position equals hidden goal coordinates (<code>map+0x1c28/0x1c2c</code>), sets <code>player[9]=1</code>.</li>
+      </ul>
+      <p>
+        Main game loop checks that byte and prints success when it flips to 1.
+      </p>
+
+      <h2 id="strategy">6. Building a Deterministic Win Strategy</h2>
+      <p>
+        Direct scripted movement can randomly fail by stepping into lava. To make the solve robust across map RNG,
+        I used predicate-guarded movement:
+      </p>
+      <pre><code class="language-text">if (NOT blocked(dir)) then move(dir)</code></pre>
+      <p>
+        Then repeated this for all four directions in a cycle, many times, within the 32-tick window.
+        Because each move is guarded by the runtime blocked/lava predicate, the script avoids fatal steps while still exploring.
+      </p>
+      <p>
+        In practice, this converged reliably and reached the goal consistently in local tests.
+      </p>
+
+      <h2 id="collisions">7. Generating Collision Keys</h2>
+      <p>
+        Since keys are hash-matched, we can use collision strings instead of true field/type names.
+        I generated printable ASCII collisions for every needed hash (type names, field names, enum names).
+      </p>
+      <pre><code class="language-python">def h(s):
+    return sum((i + 1) * ord(c) for i, c in enumerate(s))
+
+def gen_collision(target):
+    # build printable string with h(s) == target
+    # (bounded search with arithmetic feasibility pruning)
+    ...</code></pre>
+      <p>
+        Example collision targets solved this way: <code>0x572e</code> (move type), <code>0x28c</code> (direction field),
+        <code>0x4ddd</code> (if/compound action), <code>0x31cc</code>/<code>0xaffd</code> (predicate nodes).
+      </p>
+
+      <h2 id="payload">8. Final Payload Structure</h2>
+      <p>
+        Final JSON uses collision keys but semantic shape is:
+      </p>
+      <pre><code class="language-json">{
+  "on_start": [
+    {
+      "$type": "if_action_like",
+      "conditions": [
+        {
+          "$type": "predicate_not_like",
+          "inner": {
+            "$type": "is_blocked_like",
+            "dir": "LEFT"
+          }
+        }
+      ],
+      "actions": [
+        { "$type": "move_action_like", "dir": "LEFT" }
+      ]
+    },
+    {
+      "$type": "if_action_like",
+      "conditions": [ ... dir RIGHT ... ],
+      "actions": [ ... move RIGHT ... ]
+    },
+    {
+      "$type": "if_action_like",
+      "conditions": [ ... dir UP ... ],
+      "actions": [ ... move UP ... ]
+    },
+    {
+      "$type": "if_action_like",
+      "conditions": [ ... dir DOWN ... ],
+      "actions": [ ... move DOWN ... ]
+    }
+    // repeated several rounds
+  ]
+}
+END</code></pre>
+      <p>
+        Local runs repeatedly reached success (instead of lava or madness output), confirming the chain is stable.
+      </p>
+
+      <h2 id="remote">9. Remote Solve</h2>
+      <pre><code class="language-bash">cat payload.json | nc 34.179.171.239 31095</code></pre>
+      <p>
+        The remote service returned the real challenge flag line. Omitted here intentionally.
+      </p>
+      <div class="flag-box">
+        <strong>Remote result:</strong><br>
+        <code>[flag intentionally omitted from public writeup]</code>
+      </div>
+
+      <h2 id="lessons">10. Takeaways</h2>
+      <ol>
+        <li>Reflection systems must never trust hashes alone; always verify canonical string identity after hash bucket match.</li>
+        <li>CTF VM-style binaries are often easier solved by reconstructing object schemas than by brute-forcing gameplay.</li>
+        <li>When map dynamics are random, predicate-guarded action plans are more reliable than hard-coded paths.</li>
+        <li>Memory dumps plus small offline parsers are extremely effective against stripped binaries with runtime metadata.</li>
+      </ol>
+
+      <p class="note">
+        Writeup by <strong>mitza</strong> (<strong>Tudor Mihai Alexandru</strong>).<br>
+        More challenges: <a href="https://app.cyber-edu.co/user/9b4bc336-58f0-422a-9a22-9b6f4694d2cb?tenant=cyberedu" target="_blank" rel="noopener noreferrer">Cyber-EDU profile</a>
+      </p>
+    </article>
+  </main>
+
+  <footer class="site-footer container">
+    <p>mitza.ctf • Practical offensive notes from solved challenges</p>
+  </footer>
+
+  <script src="../assets/app.js"></script>
+</body>
+</html>
